@@ -136,3 +136,36 @@ An RSS feed can provide an excerpt instead of the full article. Unsubscribing re
 ## Development checks
 
 Run `node --test tests/filters.cjs` for filter and persistence checks, and `node benchmarks/library.cjs` for library benchmarks. Pass a previous `plugin.js` path to the benchmark to compare timings and behavior against that version. No packages or build step are required.
+
+
+## Catalog package
+
+The `catalog/` directory packages this Desktop plugin for the Hermes plugin catalog,
+using the [combined package layout](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk#one-package-both-sdks).
+Catalog admission is pending. The repository does not imply approval or endorsement.
+
+To install the package directly before catalog admission:
+
+```sh
+hermes plugins install Adolanium/hermes-rss/catalog
+```
+
+Restart Hermes Desktop or rescan plugins, then enable the Desktop component in
+Capabilities > Plugins. This package adds no Agent tools, hooks, or middleware.
+It requires Hermes Desktop with combined-package support. On a remote backend,
+the Desktop component must also be installed on the machine running the app.
+
+The existing root `plugin.js` remains the standalone distribution. Keep one
+installation per Desktop plugin. Before switching from a manual install, back up
+and move its folder out of the Desktop plugin directory; Hermes intentionally
+does not overwrite manual installations. Keep plugin settings when migrating.
+
+After catalog admission, use `hermes plugins update hermes-rss` and rescan
+Desktop plugins to adopt a reviewed update. The packaged copy's update and restore
+actions cannot replace its files from GitHub releases. Standalone signed updates
+continue to use the existing root files.
+
+For development, edit the root files, then run `python scripts/build_catalog.py`.
+Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
+to keep the package current, including any companion files. Catalog packaging
+releases use `catalog-v0.0.2-1` and are not marked as the latest standalone release.
