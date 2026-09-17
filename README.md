@@ -37,7 +37,7 @@ Most feed readers stop at a list of headlines. Hermes RSS gives each story a nex
 | **Read**<br />Subscribe to RSS 2.0 and Atom feeds, search your library, and open the original article. | **Remember**<br />Save the stories worth keeping, mark one feed or everything as read, and return to them across Hermes restarts. |
 | **Understand**<br />Ask for a concise summary with supporting passages from the fetched article. | **Investigate**<br />Open a native Hermes chat to discuss a story or find more sources for a claim. |
 
-The reader stays quiet until you ask it to do more. AI actions are explicit and use your configured Hermes providers.
+Summaries and source checks run when requested. Optional automatic grading sends article excerpts to your configured Hermes model after refresh; it is off by default.
 
 ## Less feed maintenance. More finishing.
 
@@ -78,6 +78,10 @@ Add a feed URL and start reading. The same `plugin.js` file is both the source a
 
 ## Search and mute rules
 
+The reader has a subscription sidebar, article list, and reading pane. Use **j** and
+**k** to move between articles, and subscription edit mode to reorder feeds and
+folders. Keyboard shortcuts pause while you type in a field.
+
 Use **Filters** to exclude a phrase, save the current search, or add mute rules for all feeds or one subscription. Matching uses literal phrases in titles and feed text and ignores case.
 
 Saved searches appear in the sidebar and remember the search phrase, exclusion, feed, reading view, and **Show hidden** choice. Searches and rules are stored with the local library for the current connection and profile.
@@ -88,7 +92,27 @@ Click a filter chip to clear it, or use **Reset filters** to return to All artic
 
 ## AI, when you ask
 
-Summaries, discussions, and source checks use your configured Hermes model and search providers. Article text is sent for those actions only; once fetched, normal feed reading stays local. Supporting passages are validated against the fetched article before they are shown.
+Summaries, discussions, and source checks use your configured Hermes model and search providers. Supporting passages are validated against the fetched article before they are shown.
+
+Settings also offers optional **AI grading**, off by default. Each run sends up to
+three batches of 60 ungraded article excerpts to your configured model and stores
+the resulting labels locally. **Grade** runs it manually. The preference skill
+controls the rubric, labels, and colors. Automatic grading stops sending new
+requests when disabled or when you switch profiles; requests already sent may
+still finish.
+
+## Full articles and images
+
+Use **Load full article** to capture readable text from the original page. Enable
+background capture in Settings to queue articles after refresh. Two workers
+process a persistent queue of up to 80 articles without delaying feed refresh.
+Captured bodies survive refresh and restart while their articles remain in the
+library. Capture uses the original page and does not bypass paywalls.
+
+The reader supports sanitized HTML, Markdown, and tables. **Load article images**
+is off by default and controls both thumbnails and images in the reading pane.
+When enabled, images load directly from publishers in Desktop and may reveal your
+IP address. Duplicate lead images are suppressed.
 
 Source checks are conversations with evidence, not automatic truth scores. Model and search providers may apply their normal usage costs.
 
@@ -100,8 +124,8 @@ Your Hermes Desktop  →  local RSS library  →  your configured AI provider (o
 
 Your subscriptions, articles, read state, saved stories, and summaries live in the local IndexedDB database `hermes-rss-library`. The data survives Hermes quits, is isolated by Hermes connection and profile, and is not synced by this plugin.
 
-- **Local reading.** Feed text is displayed without active HTML or remote images.
-- **Bounded AI context.** Summaries and chats receive the selected article context only when you start that action.
+- **Local reading.** Feed content is sanitized; scripts and embedded active content are removed. Remote images require a separate opt-in.
+- **Bounded AI context.** Summaries and chats receive selected article context when requested. Optional automatic grading sends bounded batches of excerpts after refresh.
 - **Safer fetching.** Feed URLs and redirects are checked before downloading; private network addresses and embedded credentials are rejected.
 - **Clean removal.** Removing the plugin file does not erase your local library or Hermes chats.
 
@@ -115,7 +139,7 @@ It is tested on macOS with Hermes Desktop. Windows and Linux use the same fetch 
 
 - Up to 200 subscribed feeds.
 - The first 100 entries are considered on each refresh.
-- Up to 16,000 characters are kept per article.
+- Plain feed bodies retain up to 16,000 characters, rich feed bodies up to 24,000, and captured articles up to 60,000.
 - Unsaved history is capped at 300 articles per feed; saved stories are retained.
 
 An RSS feed can provide an excerpt instead of the full article. Unsubscribing removes unsaved stories from that feed but keeps saved stories and existing Hermes chats.
@@ -135,7 +159,10 @@ An RSS feed can provide an excerpt instead of the full article. Unsubscribing re
 
 ## Development checks
 
-Run `node --test tests/filters.cjs` for filter and persistence checks, and `node benchmarks/library.cjs` for library benchmarks. Pass a previous `plugin.js` path to the benchmark to compare timings and behavior against that version. No packages or build step are required.
+Run `npm ci --ignore-scripts` and `npm test` for filter, capture, rendering, queue,
+and profile-isolation checks against the source and catalog distributions.
+Run `node benchmarks/library.cjs` for library benchmarks. The test dependencies
+are for development only; installing the plugin requires no npm packages.
 
 
 ## Catalog package
@@ -169,3 +196,11 @@ For development, edit the root files, then run `python scripts/build_catalog.py`
 Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
 to keep the package current, including any companion files. Catalog packaging
 releases use `catalog-v0.0.2-1` and are not marked as the latest standalone release.
+
+## Contributions
+
+Thanks to [@apoapostolov](https://github.com/apoapostolov) for the reader layout,
+keyboard navigation, article capture, rich rendering, media support, background
+queue, and filtering and grading enhancements in
+[PRs #4–#9](https://github.com/Adolanium/hermes-rss/pull/9). The integration retains
+the original contributor commits and adds compatibility fixes and regression tests.

@@ -1,13 +1,7 @@
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const { resolve } = require('node:path');
-const vm = require('node:vm');
 const { test } = require('node:test');
-const { randomUUID } = require('node:crypto');
-const source = readFileSync(resolve(__dirname, '../plugin.js'), 'utf8');
 function setup() {
-  const context = vm.createContext({ URL, crypto: { randomUUID } });
-  vm.runInContext(source.slice(source.indexOf('var EMPTY ='), source.indexOf('// Reader preferences')), context);
+  const context = require('./load-plugin.cjs')();
   const state = new Map();
   const initial = () => ({ feeds: [{ id: 'a' }, { id: 'b' }], articles: [
     { id: '1', feed_id: 'a', title: 'COUPON for a telescope', body: 'Mercury research', is_read: false, is_saved: true, published_at: '2026-09-03' },

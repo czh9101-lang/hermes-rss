@@ -285,7 +285,7 @@ function utf8Base64(text) {
 function gradingSkillCommand(family, name, action, payload) {
   if (family === "windows") {
     const script = [
-      "$h = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }",
+      "$h = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:USERPROFILE '.hermes' }",
       `$f = Join-Path (Join-Path (Join-Path $h 'skills') '${name}') 'SKILL.md'`,
       action === "read" ? "if (Test-Path $f) { [IO.File]::ReadAllText($f) }" : `if (Test-Path $f) { 'present' } else { New-Item -ItemType Directory -Force -Path (Split-Path $f) | Out-Null; [IO.File]::WriteAllText($f, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}'))); 'created' }`
     ].join("; ");
@@ -296,9 +296,10 @@ function gradingSkillCommand(family, name, action, payload) {
     return 'd=' + dir + '; f="$d/SKILL.md"; [ -f "$f" ] && cat "$f" || true';
   return 'd=' + dir + '; f="$d/SKILL.md"; if [ -f "$f" ]; then echo present; else mkdir -p "$d"; cat > "$f" <<\'SKILL_SCAFFOLD_EOF\'\n' + gradingScaffold(name) + '\nSKILL_SCAFFOLD_EOF\necho created; fi';
 }
-async function gradingShell(host2) {
+async function gradingShell(host2, expectedOwner) {
   const route = await currentRoute(host2);
   const owner = JSON.stringify([route.connectionId, route.profile]);
+  if (expectedOwner && owner !== expectedOwner) throw new Error("Profile changed before grading.");
   const run = async (command) => {
     assertOwner(host2, route);
     const result = await host2.requestProfile(route, "shell.exec", { command });
@@ -312,24 +313,26 @@ async function gradingShell(host2) {
   }
   return { route, owner, family, run };
 }
-async function ensureGradingSkill(host2, name) {
+async function ensureGradingSkill(host2, name, owner) {
   const skill = gradingSkillName(name);
-  const { family, run } = await gradingShell(host2);
+  const { family, run } = await gradingShell(host2, owner);
   return run(gradingSkillCommand(family, skill, "write", utf8Base64(gradingScaffold(skill))));
 }
 // Scaffold the skill if missing, then cache whatever tag table it holds.
 async function syncGradingTags(host2, ctx, owner, name) {
   try {
-    await ensureGradingSkill(host2, name);
-    const tags = parseGradingTags(await readGradingSkill(host2, name));
+    if (currentOwner(host2) !== owner || !readSettings(ctx, owner).aiGrading) return null;
+    await ensureGradingSkill(host2, name, owner);
+    const tags = parseGradingTags(await readGradingSkill(host2, name, owner));
+    if (currentOwner(host2) !== owner || !readSettings(ctx, owner).aiGrading) return null;
     cacheGradingTags(ctx, owner, tags);
     return tags;
   } catch {
     return null;
   }
 }
-async function readGradingSkill(host2, name) {
-  const { family, run } = await gradingShell(host2);
+async function readGradingSkill(host2, name, owner) {
+  const { family, run } = await gradingShell(host2, owner);
   return (await run(gradingSkillCommand(family, gradingSkillName(name), "read"))).slice(0, 8e3);
 }
 function gradingInstructions(skillText, tags) {
@@ -375,10 +378,19 @@ function validateGrades(text, pending, allowed = GRADING_LEVELS) {
   return grades;
 }
 async function gradingPass(host2, library, options) {
+  const check = () => {
+    if (currentOwner(host2) !== options.owner) throw new Error("Profile changed before grading.");
+    if (options.ctx && !options.manual && !readSettings(options.ctx, options.owner).aiGrading)
+      throw new Error("Automatic grading is off.");
+  };
+  check();
   const route = await currentRoute(host2);
-  const skillText = await readGradingSkill(host2, options.skill);
+  check();
+  const skillText = await readGradingSkill(host2, options.skill, options.owner);
   const tags = parseGradingTags(skillText);
-  const list = await library("/articles?limit=300");
+  check();
+  const list = await library(`/articles?ungraded=true&show_hidden=true&limit=${GRADING_BATCH}`);
+  check();
   const pending = (Array.isArray(list) ? list : []).filter((a) => a && a.id && a.title && !a.grade).slice(0, GRADING_BATCH);
   if (!pending.length) return { graded: 0, tags, more: false };
   let response;
@@ -401,6 +413,7 @@ async function gradingPass(host2, library, options) {
     throw error;
   }
   assertOwner(host2, route);
+  check();
   const text = typeof response?.text === "string" ? response.text : "";
   if (!text.trim())
     throw new Error(String(response?.error || response?.message || "The grading model returned no text."));
@@ -419,13 +432,14 @@ function startGrading(host2, makeLibrary, owner, options = {}) {
     try {
       const library = makeLibrary(owner);
       for (let pass = 0; pass < 3; pass++) {
-        const result = await gradingPass(host2, library, options);
+        const result = await gradingPass(host2, library, { ...options, owner });
         report.graded += result.graded;
         report.passes++;
         if (result.tags) report.tags = result.tags;
         if (!result.more) break;
       }
       // Tag colours live in the skill, so a recolour alone must repaint the list.
+      if (currentOwner(host2) !== owner) throw new Error("Profile changed before grading completed.");
       const recoloured = report.tags ? cacheGradingTags(options.ctx, owner, report.tags) : false;
       if (report.graded || recoloured) publishLibraryChange(owner);
       options.onDone?.(report);
@@ -455,81 +469,34 @@ function openDatabase() {
     });
   return database;
 }
-function profileFromOwner(owner) {
-  try {
-    const parsed = JSON.parse(owner);
-    if (Array.isArray(parsed) && parsed.length >= 2) return String(parsed[1] || "default");
-  } catch {}
-  if (typeof owner === "string" && owner.startsWith("profile:")) return owner.slice(8);
-  return String(owner || "default");
-}
 function libraryStoreKey(owner) {
-  return `profile:${profileFromOwner(owner)}`;
+  return owner;
 }
 function storageProfileKey(prefix, owner) {
-  return `${prefix}:profile:${profileFromOwner(owner)}`;
+  return `${prefix}:${owner}`;
 }
 function storageGet(ctx, prefix, owner, fallback) {
-  if (!ctx?.storage) return fallback;
-  const next = storageProfileKey(prefix, owner);
-  const hit = ctx.storage.get(next);
-  if (hit !== undefined && hit !== null) return hit;
-  const old = ctx.storage.get(`${prefix}:${owner}`, fallback);
-  if (old !== undefined && old !== fallback && old !== null) {
-    ctx.storage.set(next, old);
-    return old;
-  }
-  return old;
+  return ctx?.storage ? ctx.storage.get(storageProfileKey(prefix, owner), fallback) : fallback;
 }
 function storageSet(ctx, prefix, owner, value) {
-  if (!ctx?.storage) return;
-  ctx.storage.set(storageProfileKey(prefix, owner), value);
+  if (ctx?.storage) ctx.storage.set(storageProfileKey(prefix, owner), value);
 }
 async function transact(owner, mutate) {
   const db = await openDatabase();
-  const key = libraryStoreKey(owner);
-  const profile = profileFromOwner(owner);
-  const aliases = [owner, JSON.stringify(["local", profile])].filter((item, i, all) => item && item !== key && all.indexOf(item) === i);
   return new Promise((resolve, reject) => {
-    const tx = db.transaction("libraries", "readwrite");
+    const tx = db.transaction("libraries", mutate ? "readwrite" : "readonly");
     const store = tx.objectStore("libraries");
     let result, failure;
-    const first = store.get(key);
-    first.onsuccess = () => {
+    const request = store.get(libraryStoreKey(owner));
+    request.onsuccess = () => {
       try {
-        if (first.result) apply(first.result, false);
-        else nextAlias(0);
-      } catch (error) {
-        failure = error;
-        tx.abort();
-      }
+        const library = request.result || EMPTY();
+        result = mutate ? mutate(library) : library;
+        if (mutate) store.put(library, libraryStoreKey(owner));
+      } catch (error) { failure = error; tx.abort(); }
     };
-    function nextAlias(i) {
-      if (i >= aliases.length) {
-        apply(EMPTY(), false);
-        return;
-      }
-      const req = store.get(aliases[i]);
-      req.onsuccess = () => {
-        try {
-          if (req.result) apply(req.result, true);
-          else nextAlias(i + 1);
-        } catch (error) {
-          failure = error;
-          tx.abort();
-        }
-      };
-    }
-    function apply(library, migrated) {
-      result = mutate ? mutate(library) : library;
-      if (mutate || migrated) store.put(library, key);
-    }
     tx.oncomplete = () => resolve(result);
-    tx.onabort = tx.onerror = () => reject(
-      failure || new Error(
-        "Could not save the RSS library. Check available disk space."
-      )
-    );
+    tx.onabort = tx.onerror = () => reject(failure || new Error("Could not save the RSS library. Check available disk space."));
   });
 }
 function firstBodyImage(raw) {
@@ -539,40 +506,27 @@ function firstBodyImage(raw) {
   const html = /<img[^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)/i.exec(text);
   return html?.[1] || "";
 }
+function captureKeys(article) {
+  return [article.url ? JSON.stringify(["url", article.url]) : null,
+    article.identity ? JSON.stringify(["feed", article.feed_id, article.identity, article.url || ""]) : null].filter(Boolean);
+}
 function rememberCapture(library, article, body) {
-  if (!library.articleCache) library.articleCache = {};
+  library.articleCache ||= {};
   const entry = { body: String(body || "").slice(0, 6e4), image: article.image || "", at: Date.now() };
-  if (article.url) library.articleCache[article.url] = entry;
-  if (article.identity) library.articleCache[article.identity] = entry;
+  for (const key of captureKeys(article)) library.articleCache[key] = entry;
 }
 function applyCachedBody(library, article) {
-  if (!article) return false;
-  let dirty = false;
-  if (!article.captured) {
-    const hit = article.url && library.articleCache?.[article.url] || article.identity && library.articleCache?.[article.identity];
-    if (hit?.body && hit.body.length > (article.body || "").length) {
-      article.body = hit.body;
-      article.captured = true;
-      if (hit.image && !article.image) article.image = hit.image;
-      dirty = true;
-    }
-  }
-  if (article.captured && !article.image) {
-    const lead = firstBodyImage(article.body);
-    if (lead) {
-      article.image = lead;
-      dirty = true;
-    }
-  }
-  return dirty;
+  if (!article || article.captured) return false;
+  const hit = captureKeys(article).map(key => library.articleCache?.[key]).find(entry => entry?.body);
+  if (!hit) return false;
+  article.body = hit.body;
+  article.captured = true;
+  article.image = hit.image || article.image || firstBodyImage(hit.body);
+  return true;
 }
 function pruneArticleCache(library) {
   if (!library.articleCache) return;
-  const live = new Set();
-  for (const article of library.articles) {
-    if (article.url) live.add(article.url);
-    if (article.identity) live.add(article.identity);
-  }
+  const live = new Set(library.articles.flatMap(captureKeys));
   for (const key of Object.keys(library.articleCache)) {
     if (!live.has(key)) delete library.articleCache[key];
   }
@@ -605,20 +559,22 @@ function mergeFeed(library, feedId, parsed) {
         old.actions = (old.actions || []).map((a) => ({ ...a, stale: true }));
       // A different post under the same identity: its grade no longer applies.
       if (old.grade && old.title !== item.title) delete old.grade;
+      const changedUrl = item.url && old.url !== item.url;
+      if (changedUrl) { old.captured = false; old.image = ""; delete old.grade; }
       old.title = item.title;
       old.url = item.url || old.url;
       old.published_at = item.published_at || old.published_at;
       old.feed_title = feed.title;
-      const keepBody = old.captured || ((old.body || "").length > (item.body || "").length);
+      const keepBody = old.captured === true;
       if (!keepBody) {
         old.body = item.body;
         old.image = item.image || old.image;
       } else {
-        old.captured = true;
         old.image = old.image || item.image;
       }
       applyCachedBody(library, old);
       if (old.captured) rememberCapture(library, old, old.body);
+      else if (old.url) fresh.push(old);
     } else {
       const article = {
         ...item,
@@ -765,10 +721,10 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
           );
           pruneArticleCache(library);
         });
-      if (parts[2] === "reorder" && method === "POST")
+      if (parts[1] === "reorder" && parts.length === 2 && method === "POST")
         return write((library) => {
           const order = Array.isArray(body.order) ? body.order : [];
-          if (order.length !== library.feeds.length || !order.every(id => typeof id === "string" && library.feeds.some(f => f.id === id)))
+          if (order.length !== library.feeds.length || new Set(order).size !== order.length || !order.every(id => typeof id === "string" && library.feeds.some(f => f.id === id)))
             throw new Error("Order does not match the subscriptions.");
           library.feeds.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
           const folders = body.folders && typeof body.folders === "object" ? body.folders : null;
@@ -850,7 +806,8 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
           return write((library2) => {
             const article3 = library2.articles.find((a) => a.id === parts[1]);
             if (!article3) throw new Error("Article not found.");
-            if (typeof body.body === "string" && body.body.length > article3.body.length) {
+            if (body.url !== article3.url) throw new Error("The article URL changed during capture. Try again.");
+            if (typeof body.body === "string" && body.body.trim()) {
               article3.body = body.body.slice(0, 6e4);
               article3.captured = true;
               const lead = firstBodyImage(article3.body);
@@ -887,7 +844,7 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
       const rules = url.searchParams.get("show_hidden") === "true" ? [] : (library.filters?.mutes || []).map(rule => ({ ...rule, phrase: rule.phrase.toLowerCase() }));
       let dirty = false;
       const rows = library.articles.filter((a) => {
-        if (feed && a.feed_id !== feed || view === "unread" && a.is_read || view === "saved" && !a.is_saved) return false;
+        if (feed && a.feed_id !== feed || view === "unread" && a.is_read || view === "saved" && !a.is_saved || url.searchParams.get("ungraded") === "true" && a.grade) return false;
         if (!q && !exclude && !rules.length) return true;
         const text = `${a.title}\n${a.body}`.toLowerCase();
         return (!q || text.includes(q)) && (!exclude || !text.includes(exclude)) &&
@@ -921,7 +878,7 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
   };
 }
 
-// Reader preferences and scheduled feed refresh (never starts an AI action).
+// Background capture and grading require their own saved opt-ins.
 function readSettings(ctx, owner) {
   const stored = storageGet(ctx, "settings", owner, {}) || {};
   return {
@@ -929,6 +886,7 @@ function readSettings(ctx, owner) {
     refreshMinutes: Number.isInteger(stored.refreshMinutes) && stored.refreshMinutes >= 1 && stored.refreshMinutes <= 1440 ? stored.refreshMinutes : 15,
     markReadOnOpen: stored.markReadOnOpen !== false,
     fullCapture: stored.fullCapture === true,
+    loadImages: stored.loadImages === true,
     aiGrading: stored.aiGrading === true,
     gradingSkill: typeof stored.gradingSkill === "string" && stored.gradingSkill.trim() ? stored.gradingSkill : DEFAULT_GRADING_SKILL,
     gradingTags: readGradingTags(ctx, owner)
@@ -1026,7 +984,8 @@ function withCaptureSlot(work) {
       });
     };
     if (captureActive < 2) run();
-    else captureWaiters.push(run);
+    else if (captureWaiters.length < 80) captureWaiters.push(run);
+    else reject(new Error("The capture queue is full. Try again after current jobs finish."));
   });
 }
 function startCaptureWorker(ctx, host2) {
@@ -1037,7 +996,7 @@ function startCaptureWorker(ctx, host2) {
   const MAX_ATTEMPTS = 2;
   const load = (owner) => {
     const raw = storageGet(ctx, "captureQueue", owner, []) || [];
-    return Array.isArray(raw) ? raw.filter((j) => j && j.id && j.url) : [];
+    return Array.isArray(raw) ? raw.filter((j) => j && typeof j.id === "string" && typeof j.url === "string").slice(0, MAX_QUEUE) : [];
   };
   const save = (owner, q) => storageSet(ctx, "captureQueue", owner, q.slice(0, MAX_QUEUE));
   const enqueue = (owner, items, { front = false } = {}) => {
@@ -1065,13 +1024,15 @@ function startCaptureWorker(ctx, host2) {
   async function pump() {
     if (stopped) return;
     const owner = currentOwner(host2);
-    while (!stopped && active.size < CONCURRENCY) {
+    if (!readSettings(ctx, owner).fullCapture) return;
+    while (!stopped && currentOwner(host2) === owner && active.size < CONCURRENCY) {
       const q = load(owner);
-      const job = q.find((j) => !active.has(j.id));
+      const job = q.find((j) => !active.has(JSON.stringify([owner, j.id])));
       if (!job) break;
-      active.add(job.id);
+      const key = JSON.stringify([owner, job.id]);
+      active.add(key);
       void runJob(owner, job).finally(() => {
-        active.delete(job.id);
+        active.delete(key);
         if (!stopped) void pump();
       });
     }
@@ -1084,13 +1045,16 @@ function startCaptureWorker(ctx, host2) {
         save(owner, load(owner).filter((j) => j.id !== job.id));
         return;
       }
-      const result = await captureArticle(host2, job.url, {
-        knownLength: (article.body || "").length
-      });
+      if (stopped || currentOwner(host2) !== owner || !readSettings(ctx, owner).fullCapture) return;
+      if (article.url !== job.url) {
+        save(owner, load(owner).filter((j) => j.id !== job.id));
+        return;
+      }
+      const result = await captureArticle(host2, job.url, { owner });
       const fullBody = result.body;
-      if (stopped || currentOwner(host2) !== owner) return;
+      if (stopped || currentOwner(host2) !== owner || !readSettings(ctx, owner).fullCapture) return;
       if (fullBody && fullBody.length > (article.body || "").length) {
-        await library(`/articles/${job.id}/capture`, { method: "POST", body: { body: fullBody } });
+        await library(`/articles/${job.id}/capture`, { method: "POST", body: { body: fullBody, url: job.url } });
         publishLibraryChange(owner);
       }
       save(owner, load(owner).filter((j) => j.id !== job.id));
@@ -1199,8 +1163,8 @@ async function resolvePublicIPv4(run, family, hostname) {
 }
 async function readPackedFeed(run, family, directory, feedPath) {
   if (family === "windows") {
-    const gzPath = `${directory}\\feed.gz`;
-    const b64Path = `${directory}\\feed.b64`;
+    const gzPath = `${feedPath}.gz`;
+    const b64Path = `${feedPath}.b64`;
     await run(
       `powershell -NoProfile -NonInteractive "Add-Type -AssemblyName System.IO.Compression; $in=[IO.File]::OpenRead(${powershellSingle(feedPath)}); $out=[IO.File]::Create(${powershellSingle(gzPath)}); $gzs=New-Object IO.Compression.GZipStream($out,[IO.Compression.CompressionMode]::Compress); $in.CopyTo($gzs); $gzs.Dispose(); $in.Dispose(); [IO.File]::WriteAllText(${powershellSingle(b64Path)},[Convert]::ToBase64String([IO.File]::ReadAllBytes(${powershellSingle(gzPath)})))"`
     );
@@ -1364,6 +1328,7 @@ function parseFeed(xml, base) {
 async function captureArticle(host2, rawUrl, options = {}) {
   const route = await currentRoute(host2);
   const owner = JSON.stringify([route.connectionId, route.profile]);
+  if (options.owner && options.owner !== owner) throw new Error("Profile changed before capture.");
   return withCaptureSlot(() => captureArticleNow(host2, rawUrl, route, owner, options));
 }
 function httpsSrc(value) {
@@ -1516,7 +1481,8 @@ async function captureArticleNow(host2, rawUrl, route, owner, options = {}) {
     }
     caches.set(owner, directory);
   }
-  const pagePath = family === "windows" ? `${directory}\\page` : `${directory}/page`;
+  const captureId = crypto.randomUUID().replaceAll("-", "");
+  const pagePath = family === "windows" ? `${directory}\\page-${captureId}` : `${directory}/page-${captureId}`;
   const quote = family === "windows" ? cmdQuote : posixQuote;
   const curl = family === "windows" ? "curl.exe" : "curl";
   const readHtml = async (target) => {
@@ -1525,12 +1491,16 @@ async function captureArticleNow(host2, rawUrl, route, owner, options = {}) {
       const addresses = await resolvePublicIPv4(run, family, url.hostname);
       const port = url.port || (url.protocol === "https:" ? "443" : "80");
       const info = await run(
-        `${curl} --disable --silent --show-error --noproxy ${quote("*")} --proto ${quote("=http,https")} --connect-timeout 8 --max-time 25 --max-filesize 2000000 --resolve ${quote(`${url.hostname}:${port}:${addresses[0]}`)} --location --header ${quote("Accept: text/html,application/xhtml+xml")} --header ${quote("Accept-Encoding: identity")} --user-agent ${quote("Mozilla/5.0 (compatible; HermesRSS/0.2; reader mode)")} --output ${quote(pagePath)} --write-out ${quote("%{http_code} %{size_download}")} --url ${quote(url.href)}`
+        `${curl} --disable --silent --show-error --noproxy ${quote("*")} --proto ${quote("=http,https")} --connect-timeout 8 --max-time 25 --max-filesize 2000000 --resolve ${quote(`${url.hostname}:${port}:${addresses[0]}`)} --header ${quote("Accept: text/html,application/xhtml+xml")} --header ${quote("Accept-Encoding: identity")} --user-agent ${quote("Mozilla/5.0 (compatible; HermesRSS/0.2; reader mode)")} --output ${quote(pagePath)} --write-out ${quote("%{http_code} %{size_download} %{redirect_url}")} --url ${quote(url.href)}`
       );
-      const match = /^(\d{3}) ([0-9]+)$/.exec(info);
+      const match = /^(\d{3}) ([0-9]+)(?: (.*))?$/.exec(info);
       if (!match) throw new Error("Invalid page download response.");
-      const code = match[1], size = match[2];
+      const [, code, size, next] = match;
       if (Number(size) > 2e6) throw new Error("Page exceeds 2 MB.");
+      if (["301", "302", "303", "307", "308"].includes(code) && next) {
+        url = publicUrl(next);
+        continue;
+      }
       if (code !== "200") throw new Error(`The page returned HTTP ${code}.`);
       success = true;
       break;
@@ -1547,12 +1517,17 @@ async function captureArticleNow(host2, rawUrl, route, owner, options = {}) {
   const finish = (text, source) => ({ body: text.slice(0, 6e4), source });
   const usable = (text) => Boolean(text) && text.length >= 200;
   const target = publicUrl(rawUrl);
-  const knownLength = Math.max(0, Number(options.knownLength) || 0);
   let direct = "", directError = null;
   try {
     direct = extractReadable(await readHtml(target.href));
   } catch (error) {
     directError = error;
+  } finally {
+    const files = [pagePath, `${pagePath}.gz`, `${pagePath}.b64`];
+    const cleanup = family === "windows"
+      ? `powershell -NoProfile -NonInteractive "Remove-Item -LiteralPath ${files.map(powershellSingle).join(",")} -Force -ErrorAction SilentlyContinue"`
+      : `rm -f -- ${files.map(posixQuote).join(" ")}`;
+    try { await run(cleanup, true); } catch { /* A disconnected gateway may leave temporary files. */ }
   }
   if (!usable(direct))
     throw directError || new Error("No readable article text found on the page.");
@@ -1585,7 +1560,7 @@ function feedItemBody(rawContent) {
 function sanitizeRichHtml(source) {
   const template = document.createElement("template");
   template.innerHTML = source;
-  template.content.querySelectorAll("script,style,noscript,iframe,object,embed,form,button,input,select,textarea,link,meta,svg").forEach((n) => n.remove());
+  template.content.querySelectorAll("script,style,noscript,iframe,object,embed,form,button,input,select,textarea,link,meta,svg,math,video,audio,source,template").forEach((n) => n.remove());
   for (const image of [...template.content.querySelectorAll("img")]) {
     if (isTrackingPixel(image)) { image.remove(); continue; }
     const src = imgSrcFrom(image);
@@ -1656,6 +1631,23 @@ function withGradeNote(html, grade, tag) {
 function withLeadImage(html, lead) {
   return dedupeArticleImages(html, lead);
 }
+function readerHtml(html, lead, loadImages) {
+  const template = document.createElement("template");
+  template.innerHTML = sanitizeRichHtml(withLeadImage(html, lead));
+  for (const image of [...template.content.querySelectorAll("img")]) {
+    const src = publicImageUrl(image.getAttribute("src"));
+    if (!loadImages || !src) image.remove();
+    else { image.setAttribute("src", src); image.setAttribute("referrerpolicy", "no-referrer"); }
+  }
+  return template.innerHTML;
+}
+function publicImageUrl(raw) {
+  try {
+    const url = publicUrl(httpsSrc(raw));
+    if (/^[0-9.]+$/.test(url.hostname) && !publicIPv4(url.hostname)) return "";
+    return url.href;
+  } catch { return ""; }
+}
 function mdTableHtml(rows) {
   const cells = rows.map((r) => r.replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
   if (cells.length < 2) return "";
@@ -1672,11 +1664,11 @@ function mdTableHtml(rows) {
   html += "<tbody>" + body.map((r) => "<tr>" + pad(r).map(cell).join("") + "</tr>").join("") + "</tbody></table></div>";
   return html;
 }
-function bodyToRichHtml(raw, lead) {
+function bodyToRichHtml(raw, lead, loadImages = false) {
   const source = String(raw || "");
   const looksLikeHtml = /<\/?(p|div|h[1-6]|ul|ol|li|img|a|blockquote|table|br|figure)\b/i.test(source);
   if (looksLikeHtml) {
-    return { html: withLeadImage(sanitizeRichHtml(source), lead), isHtml: true };
+    return { html: readerHtml(source, lead, loadImages), isHtml: true };
   }
   const lines = source.split(/\n/);
   const out = [];
@@ -1748,7 +1740,7 @@ function bodyToRichHtml(raw, lead) {
   if (inCode) out.push(`<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`);
   flushParagraph();
   closeList();
-  return { html: withLeadImage(out.join(""), lead), isHtml: false };
+  return { html: readerHtml(out.join(""), lead, loadImages), isHtml: false };
 }
 
 // src/styles.mjs
@@ -1941,7 +1933,7 @@ html[data-hermes-mode="light"] .hermes-rss select{color-scheme:light}
 
 // src/plugin.jsx
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var ID = "hermes-rss-reader";
+var ID = "hermes-rss";
 var labels = {
   supported: "Supported by retrieved evidence",
   conflicting: "Conflicting evidence",
@@ -2036,7 +2028,8 @@ function previewNavFeeds(list, draggingId, dropIndex, targetFolder) {
 }
 function Reader({ ctx }) {
   const profile = useValue(host.state.profile);
-  const connection = useValue(host.state.connectionId || host.state.profile);
+  const connectionValue = useValue(host.state.connectionId || host.state.profile);
+  const connection = host.state.connectionId ? connectionValue : "local";
   return /* @__PURE__ */ jsx(
     ReaderProfile,
     {
@@ -2262,6 +2255,7 @@ function ReaderProfile({ ctx, owner }) {
     const report = await new Promise((resolve) => {
       const started = startGrading(host, () => library, owner, {
         skill: settings.gradingSkill,
+        manual: true,
         ctx,
         onDone: resolve,
         onError: (error) => resolve({ graded: 0, error })
@@ -2280,8 +2274,8 @@ function ReaderProfile({ ctx, owner }) {
         knownLength: (target.body || "").length
       });
       const fullBody = result.body;
-      if (!fullBody || fullBody.length <= target.body.length) return;
-      await libraryRequest(`/articles/${target.id}/capture`, { method: "POST", body: { body: fullBody } });
+      if (!fullBody) return;
+      await libraryRequest(`/articles/${target.id}/capture`, { method: "POST", body: { body: fullBody, url: target.url } });
       if (result.source) setNotice(`The full text came from ${result.source}.`);
     });
   };
@@ -2411,9 +2405,9 @@ function ReaderProfile({ ctx, owner }) {
     if (sameOrder && sameFolders) return;
     setDragOrder(order);
     act("Reordering…", async () => {
-      await libraryRequest("/feeds/reorder", { method: "POST", body: { order, folders } });
-      refresh();
-      setDragOrder(null);
+      try {
+        await libraryRequest("/feeds/reorder", { method: "POST", body: { order, folders } });
+      } finally { setDragOrder(null); }
     });
   };
   const saveSettings = event => {
@@ -2608,7 +2602,7 @@ function ReaderProfile({ ctx, owner }) {
                 "minutes"
               ] })
             ] }),
-            jsx("p", { className: "rss-muted rss-small", children: typeof ctx.onDispose === "function" ? "Runs while Hermes is open. No AI. This profile only." : "This Hermes version needs an SDK update for background refresh. Manual refresh still works." })
+            jsx("p", { className: "rss-muted rss-small", children: typeof ctx.onDispose === "function" ? "Refreshes this profile while Hermes is open. Capture and AI grading have separate opt-ins." : "This Hermes version needs an SDK update for background refresh. Manual refresh still works." })
           ] }),
           jsxs("div", { className: "rss-settings-block", children: [
             jsx("h2", { className: "rss-settings-header", children: "Capturing" }),
@@ -2625,7 +2619,12 @@ function ReaderProfile({ ctx, owner }) {
             jsx("label", { className: "rss-setting", children: [
               jsx("input", { type: "checkbox", checked: draft.markReadOnOpen, onChange: event => setDraft({ ...draft, markReadOnOpen: event.target.checked }) }),
               "Mark articles as read when opened"
-            ] })
+            ] }),
+            jsx("label", { className: "rss-setting", children: [
+              jsx("input", { type: "checkbox", checked: draft.loadImages, onChange: event => setDraft({ ...draft, loadImages: event.target.checked }) }),
+              "Load article images"
+            ] }),
+            jsx("p", { className: "rss-muted rss-small", children: "Images load from publishers in Desktop and may reveal your IP address. Off by default." })
           ] }),
           jsxs("div", { className: "rss-settings-block", children: [
             jsx("h2", { className: "rss-settings-header", children: "AI grading" }),
@@ -2633,7 +2632,7 @@ function ReaderProfile({ ctx, owner }) {
               jsx("input", { type: "checkbox", checked: draft.aiGrading, onChange: event => setDraft({ ...draft, aiGrading: event.target.checked }) }),
               "Grade articles by importance"
             ] }),
-            jsx("p", { className: "rss-muted rss-small", children: "After a refresh, every ungraded article goes to the auxiliary model in one batch and the list tints when the answer arrives. Nothing is sent while this is off." }),
+            jsx("p", { className: "rss-muted rss-small", children: "After refresh, send up to three batches of 60 ungraded article excerpts to your configured model. Turn this off to stop automatic grading. Grade starts a batch manually." }),
             jsxs("div", { className: "rss-setting-row", children: [
               jsxs("label", { className: "rss-setting rss-setting-inline", children: [
                 "Preference skill",
@@ -2641,7 +2640,7 @@ function ReaderProfile({ ctx, owner }) {
               ] }),
               jsx(Button, { type: "button", disabled: disabled || !articles.data?.length, onClick: gradeNow, children: "Grade" })
             ] }),
-            jsx("p", { className: "rss-muted rss-small", children: `Loaded while grading. If ${DEFAULT_GRADING_SKILL} is missing it is created with a starter rubric when the reader loads, for Hermes to maintain.` })
+            jsx("p", { className: "rss-muted rss-small", children: "The skill is read while grading. Enabling automatic grading creates a starter rubric if the named skill is missing." })
           ] })
         ] }),
         jsx("div", { className: "rss-tools", children: [jsx(Button, { type: "submit", children: "Save settings" }), jsx(Button, { type: "button", variant: "ghost", onClick: () => setSettingsOpen(false), children: "Cancel" })] })
@@ -2899,7 +2898,7 @@ function ReaderProfile({ ctx, owner }) {
                     ] }),
                     /* @__PURE__ */ jsx("p", { className: "rss-card-excerpt", children: item.excerpt })
                   ] }),
-                  item.image && /* @__PURE__ */ jsx("span", { className: "rss-card-thumb", "aria-hidden": "true", children: /* @__PURE__ */ jsx("img", { src: item.image, alt: "", loading: "lazy", onError: (event) => { event.currentTarget.parentElement.style.display = "none"; } }) })
+                  settings.loadImages && publicImageUrl(item.image) && /* @__PURE__ */ jsx("span", { className: "rss-card-thumb", "aria-hidden": "true", children: /* @__PURE__ */ jsx("img", { src: publicImageUrl(item.image), alt: "", loading: "lazy", referrerPolicy: "no-referrer", onError: (event) => { event.currentTarget.parentElement.style.display = "none"; } }) })
                 ] })
               ]
             },
@@ -3069,7 +3068,7 @@ function ReaderProfile({ ctx, owner }) {
           }
         ),
         tab === "article" && (() => {
-          const rich = bodyToRichHtml(article.body || "", article.image);
+          const rich = bodyToRichHtml(article.body || "", article.image, settings.loadImages);
           const gradeTag = gradingTagFor(settings.gradingTags, article.grade?.level);
           const bodyHtml = gradeTag && gradeTag.label ? withGradeNote(rich.html, article.grade, gradeTag) : rich.html;
           return /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
@@ -3180,19 +3179,12 @@ var plugin_default = {
   id: ID,
   name: "RSS Reader",
   description: "RSS reader with reader-mode capture, edit-mode subscriptions, and keyboard shortcuts.",
-  version: "1.0.0",
+  version: "0.0.2",
   defaultEnabled: true,
   register(ctx) {
     if (typeof ctx.onDispose === "function") ctx.onDispose(startAutoRefresh(ctx, host));
     ctx.onDispose ? ctx.onDispose(startCaptureWorker(ctx, host)) : startCaptureWorker(ctx, host);
-    try {
-      // The rubric and the tag colours both live in the skill: scaffold it when
-      // it is missing, cache the table, then repaint so pills pick it up.
-      const owner = currentOwner(host);
-      void syncGradingTags(host, ctx, owner, readSettings(ctx, owner).gradingSkill).then(() => publishLibraryChange(owner));
-    } catch {
-      // Storage is not ready yet; the first grading run scaffolds the skill.
-    }
+
     ctx.register({
       id: "page",
       area: ROUTES_AREA,
