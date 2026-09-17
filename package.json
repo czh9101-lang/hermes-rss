@@ -1,0 +1,10 @@
+{
+  "name": "hermes-rss-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/filters.cjs tests/reader.cjs"
+  },
+  "devDependencies": {
+    "jsdom": "29.1.1"
+  }
+}

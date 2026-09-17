@@ -7,13 +7,11 @@ const vm = require('node:vm');
 const { performance } = require('node:perf_hooks');
 
 function load(file) {
-  const source = fs.readFileSync(file, 'utf8');
   let id = 0;
-  const context = vm.createContext({
+  const context = require('../tests/load-plugin.cjs')(file, {
     URL, crypto: { randomUUID: () => `new-${++id}` },
     Date: class extends Date { constructor(...args) { super(...(args.length ? args : ['2026-09-05T00:00:00Z'])); } }
   });
-  vm.runInContext(source.slice(source.indexOf('var EMPTY ='), source.indexOf('// Reader preferences')), context);
   return context;
 }
 function fixture(count) {
